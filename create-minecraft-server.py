@@ -1,451 +1,430 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
-
-# 
-# CODE ADAPTED TO PYTHON FROM 'LUCAST' PROJECT: https://github.com/Luc4st1574/MSP_MINECRAFT-SERVER-PROJECT
-# 
-
-version = '1.20.4'
-# 
-# For older versions, you can use fabric or vanilla, forge wont work
-# 
-# AVAILABLE TESTED VERSIONS:
-# - 1.20.4
-# - 1.20.3
-# - 1.20.2
-# - 1.20.1
-# - 1.20
-# - 1.19.4
-# - 1.19.3
-# - 1.19.2
-# - 1.19.1
-# - 1.19
-# - 1.18.2
-# - 1.18.1
-# - 1.18
-# - 1.17.1
-
-server_type = 'vanilla'
-# 
-# To use paper, you must install vanilla first and then install paper
-# To use mohist or catserver, you must install forge first and then install mohist or catserver
-# To use purpur, you must install fabric first and then install purpur
-# 
-# AVALIBLE SERVER TYPES:
-# - paper (The most optimized server for Spigot/Bukkit)
-# - forge (For modded servers)
-# - fabric (For modded servers)(Alternative to forge)
-# - vanilla (For vanilla servers)
-# - snapshot (For testing new features)
-# - mohist (For modded servers and plugins) 1.20.1 29/09/24 last version available
-# - catserver (For modded servers and plugins) 1.18.2 29/09/24 last version available
-# - purpur (For modded servers with fabric and plugins)
-
-# Create main files
 import os
+import psutil
 import requests
-import re
 import json
 import subprocess
+import threading
+import inquirer
+from typing import Optional, List, Tuple, Type
+from datetime import datetime
 
-# Create the server directory on the codespace
-os.makedirs("Minecraft-server", exist_ok=True)
-os.chdir("Minecraft-server")
+# Terminal colors
+RESET = "\033[0m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+RED = "\033[91m"
+CYAN = "\033[96m"
 
-# Methods
-def get_version_fabric(api_url):
+# Base directory for servers
+BASE_DIR = os.path.abspath("Minecraft-servers")
+os.makedirs(BASE_DIR, exist_ok=True)
+
+def log_message(message: str, color: str = RESET, end: str = '\n') -> None:
+    """Print a formatted log message with timestamp."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"{color}[{timestamp}] {message}{RESET}", end=end)
+
+class TunnelService:
+    def __init__(self, local_port: int = 25565):
+        self.local_port = local_port
+
+    def start_tunnel(self):
+        raise NotImplementedError("Each service must implement its own tunnel method")
+
+class NgrokTunnel(TunnelService):
+    def __init__(self, local_port: int = 25565, auth_token: str = "2ntG1Do0RPAj8ozh2Bmdt5oc3tw_3L4tzn1UZfXFnFr8Kau2n"):
+        super().__init__(local_port)
+        self.auth_token = auth_token or os.getenv("NGROK_AUTH_TOKEN")
+
+    def start_tunnel(self):
+        if not self.auth_token:
+            log_message("⚠️  No Ngrok authentication token provided.", RED)
+            return None
+
+        subprocess.run(["ngrok", "config", "add-authtoken", self.auth_token], 
+                     stdout=subprocess.PIPE, 
+                     stderr=subprocess.PIPE)
+        
+        log_message("🚀 Starting Ngrok tunnel service...", CYAN)
+
+        tunnel_process = subprocess.Popen(
+            ["ngrok", "tcp", str(self.local_port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+
+        def get_public_url():
+            import time
+            while True:
+                try:
+                    response = requests.get("http://localhost:4040/api/tunnels")
+                    data = response.json()
+                    public_url = data['tunnels'][0]['public_url'].replace('tcp://', '')
+                    log_message(f"✨ Server accessible at: {public_url}", GREEN)
+                    break
+                except Exception:
+                    time.sleep(1)
+
+        url_thread = threading.Thread(target=get_public_url)
+        url_thread.daemon = True
+        url_thread.start()
+        return tunnel_process
+
+class PlayitGGTunnel(TunnelService):
+    def start_tunnel(self):
+        log_message("🚀 Starting Playit.gg tunnel service...", CYAN)
+        tunnel_process = subprocess.Popen(
+            ["playit", "run"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+
+        def read_output():
+            for line in tunnel_process.stdout:
+                if "agent connected" in line.lower():
+                    log_message("✅ Playit.gg agent connected successfully!", GREEN)
+                elif "tunnel ready" in line.lower():
+                    address = line.strip().split()[-1]
+                    log_message(f"✨ Server accessible at: {address}", GREEN)
+
+        tunnel_thread = threading.Thread(target=read_output)
+        tunnel_thread.daemon = True
+        tunnel_thread.start()
+        return tunnel_process
+
+def release_port(port: int = 25565) -> None:
+    """Release the specified port if in use."""
+    try:
+        subprocess.run(f"fuser -k {port}/tcp", 
+                      shell=True, 
+                      stdout=subprocess.PIPE, 
+                      stderr=subprocess.PIPE)
+        log_message(f"🔓 Port {port} released successfully", GREEN, end='\n\n')
+    except Exception as e:
+        log_message(f"⚠️  Could not release port {port}: {str(e)}", YELLOW)
+
+def get_available_tunnel_services() -> List[Tuple[str, Type[TunnelService]]]:
+    """Check which tunnel services are available on the system."""
+    available_services = []
+    
+    if subprocess.run(["which", "ngrok"], stdout=subprocess.PIPE).returncode == 0:
+        available_services.append(("Ngrok", NgrokTunnel))
+    
+    if subprocess.run(["which", "playit"], stdout=subprocess.PIPE).returncode == 0:
+        available_services.append(("Playit.gg", PlayitGGTunnel))
+    
+    return available_services
+
+def select_tunnel_service() -> Optional[TunnelService]:
+    """Allow user to select an available tunnel service."""
+    available_services = get_available_tunnel_services()
+    
+    if not available_services:
+        log_message("⚠️  No tunnel services found. Please install one of the following:", YELLOW)
+        log_message("📦 Ngrok (https://ngrok.com/download)", BLUE)
+        log_message("📦 Playit.gg (https://playit.gg)", BLUE)
+        return None
+
+    questions = [
+        inquirer.List('tunnel_service',
+                     message="Select tunnel service",
+                     choices=[name for name, _ in available_services])
+    ]
+    
+    answer = inquirer.prompt(questions)
+    selected_service = next((service for name, service in available_services 
+                           if name == answer['tunnel_service']), None)
+    
+    return selected_service(25565) if selected_service else None
+
+def get_minecraft_versions() -> List[str]:
+    """Obtiene todas las versiones de lanzamiento de Minecraft desde el manifiesto de Mojang y asegura que '1.18.2' esté incluida."""
+    try:
+        # Endpoint oficial de Mojang para el manifiesto de versiones
+        response = requests.get("https://launchermeta.mojang.com/mc/game/version_manifest.json")
+        if response.status_code == 200:
+            versions = response.json().get('versions', [])
+            # Filtra solo las versiones de tipo "release" para incluir solo versiones completas
+            release_versions = [v["id"] for v in versions if v["type"] == "release"]
+            
+            # Asegura que '1.18.2' esté en la lista
+            if "1.18.2" not in release_versions:
+                release_versions.append("1.18.2")
+                
+            return release_versions
+    except Exception as e:
+        log_message(f"Error fetching versions: {e}", RED)
+    
+    # Lista de versiones por defecto si falla la API
+    return ["1.20.4", "1.20.3", "1.20.2", "1.19.4", "1.18.2", "1.18.1", "1.18", "1.17.1", "1.17", "1.16.5"]
+
+def download_server(url: str, output_path: str) -> bool:
+    """Download server jar with progress indicator."""
+    try:
+        response = requests.get(url, stream=True)
+        total_size = int(response.headers.get('content-length', 0))
+        block_size = 1024
+        current_size = 0
+
+        with open(output_path, 'wb') as f:
+            for data in response.iter_content(block_size):
+                current_size += len(data)
+                f.write(data)
+                
+                if total_size:
+                    percentage = int((current_size / total_size) * 100)
+                    print(f"\rDownloading: {percentage}%", end='')
+            
+        print("\n")
+        return True
+    except Exception as e:
+        log_message(f"⚠️  Download failed: {str(e)}", RED)
+        return False
+
+def get_paper_download_url(version: str) -> Optional[str]:
+    """URL de descarga para PaperMC."""
+    response = requests.get(f"https://papermc.io/api/v2/projects/paper/versions/{version}")
+    if response.status_code != 200:
+        log_message(f"Error al obtener versión PaperMC {version}.", RED)
+        return None
+    builds = response.json().get('builds', [])
+    latest_build = builds[-1] if builds else None
+    if not latest_build:
+        log_message(f"No se encontraron builds para PaperMC {version}.", RED)
+        return None
+    return f"https://papermc.io/api/v2/projects/paper/versions/{version}/builds/{latest_build}/downloads/paper-{version}-{latest_build}.jar"
+    
+def get_vanilla_download_url(version: str) -> Optional[str]:
+    """URL de descarga para Vanilla."""
+    manifest_response = requests.get("https://launchermeta.mojang.com/mc/game/version_manifest.json")
+    if manifest_response.status_code != 200:
+        log_message("Error al obtener el manifiesto de versiones.", RED)
+        return None
+    version_manifest_url = next((v["url"] for v in manifest_response.json()["versions"] if v["id"] == version), None)
+    version_manifest = requests.get(version_manifest_url).json() if version_manifest_url else {}
+    return version_manifest.get("downloads", {}).get("server", {}).get("url")
+
+def get_fabric_version(api_url: str) -> Optional[str]:
+    """Obtiene la última versión estable de Fabric desde la API."""
     response = requests.get(api_url)
     if response.status_code == 200:
-        versions = response.json()
-        for version in versions[:5]:
-            if version.get("stable", False):
-                return version["version"]
-        return versions[0]["version"]
-    else:
-        print(f"Error al solicitar la API: {api_url}")
+        return next((v["version"] for v in response.json() if v.get("stable")), None)
+    log_message(f"Error accediendo a la API: {api_url}.", RED)
+    return None
+
+def get_fabric_download_url(version: str) -> Optional[str]:
+    """URL de descarga para Fabric."""
+    loader_version = get_fabric_version("https://meta.fabricmc.net/v2/versions/loader")
+    installer_version = get_fabric_version("https://meta.fabricmc.net/v2/versions/installer")
+    return f"https://meta.fabricmc.net/v2/versions/loader/{version}/{loader_version}/{installer_version}/server/jar" if loader_version and installer_version else None
+
+def get_server_download_url(server_type: str, version: str) -> Optional[str]:
+    """Obtiene la URL de descarga según el tipo y versión de servidor."""
+    if server_type == 'paper':
+        return get_paper_download_url(version)
+    elif server_type == 'vanilla':
+        return get_vanilla_download_url(version)
+    elif server_type == 'fabric':
+        return get_fabric_download_url(version)
+    return None
+
+def create_server_properties(server_dir: str, server_name: str):
+    """Create default server.properties file."""
+    properties = {
+        "server-name": server_name,
+        "gamemode": "survival",
+        "difficulty": "normal",
+        "max-players": "20",
+        "view-distance": "10",
+        "spawn-protection": "16",
+        "enable-command-block": "false",
+        "motd": f"§6Welcome to {server_name}!",
+        "online-mode": "false"
+    }
+    
+    with open(os.path.join(server_dir, 'server.properties'), 'w') as f:
+        for key, value in properties.items():
+            f.write(f"{key}={value}\n")
+
+def create_new_server() -> Optional[str]:
+    """Create a new Minecraft server."""
+    log_message("🆕 Creating new Minecraft server...", BLUE)
+    
+    # Solicitar el nombre del servidor
+    name = input("Enter server name: ").strip()
+    if not name:
+        log_message("⚠️  Server name cannot be empty!", RED)
         return None
 
-# Internal init...
-if server_type == 'paper':
-    a = requests.get("https://papermc.io/api/v2/projects/paper/versions/" + version)
-    b = requests.get("https://papermc.io/api/v2/projects/paper/versions/" + version + "/builds/" + str(a.json()["builds"][-1]))
-    print("https://papermc.io/api/v2/projects/paper/versions/" + version + "/builds/" + str(a.json()["builds"][-1]) + "/downloads/" + b.json()["downloads"]["application"]["name"])
-    serverURL = "https://papermc.io/api/v2/projects/paper/versions/" + version + "/builds/" + str(a.json()["builds"][-1]) + "/downloads/" + b.json()["downloads"]["application"]["name"]
+    # Obtener la lista de versiones y solicitar la selección
+    versions = get_minecraft_versions()
+    version = inquirer.prompt([
+        inquirer.List("version", 
+                      message="Select Minecraft version", 
+                      choices=versions)
+    ])["version"]
 
-# Select the server.jar (url) based on 'server_type'
-# if server_type == 'forge':
-#     serverURL = "https://serverjars.com/api/fetchJar/modded/forge/" + version
-# elif server_type == 'vanilla':
-#     serverURL = "https://serverjars.com/api/fetchJar/vanilla/vanilla/" + version
-# elif server_type == 'snapshot':
-#     serverURL = "https://serverjars.com/api/fetchJar/vanilla/snapshot/" + version
-# elif server_type == 'fabric':
-#     serverURL = 'https://serverjars.com/api/fetchJar/modded/fabric/' + version
-# elif server_type == 'mohist':
-#     serverURL = "https://serverjars.com/api/fetchJar/modded/mohist/" + version
-# elif server_type == 'catserver':
-#     serverURL = "https://serverjars.com/api/fetchJar/modded/catserver/" + version
-# elif server_type == 'purpur':
-#     serverURL = "https://serverjars.com/api/fetchJar/servers/purpur/" + version
+    # Solicitar el tipo de servidor
+    server_type = inquirer.prompt([
+        inquirer.List("type", 
+                      message="Select server type", 
+                      choices=["paper", "vanilla", "fabric"])
+    ])["type"]
 
-# ServerJars DOWN
-# ACTIVE
-if server_type == 'forge':
-    forge_base_url = "https://maven.minecraftforge.net/net/minecraftforge/forge"
-    metadata_url = f"{forge_base_url}/maven-metadata.xml"
+    log_message(f"📥 Setting up {server_type} server version {version}...", CYAN)
 
-    response = requests.get(metadata_url)
-    if response.status_code == 200:
-        metadata = response.text
-        versions = metadata.split('<version>')
-        versions = [v.split('</version>')[0] for v in versions[1:]]
-        matching_versions = [v for v in versions if v.startswith(version)]
-        if matching_versions:
-            def version_key(v):
-                main_version, sub_version = v.split('-')[0], v.split('-')[1]
-                return [int(x) for x in main_version.split('.')] + [int(x) for x in sub_version.split('.')]
-            
-            latest_matching_version = max(matching_versions, key=version_key)
-            serverURL = f"{forge_base_url}/{latest_matching_version}/forge-{latest_matching_version}-installer.jar"
-        else:
-            serverURL = None
-    else:
-        serverURL = None
+    # Obtener la URL de descarga según el tipo de servidor y la versión seleccionada
+    url = get_server_download_url(server_type, version)
+    
+    if not url:
+        log_message("⚠️  Could not determine server download URL!", RED)
+        return None
 
-# ACTIVE
-elif server_type == 'vanilla':
-    manifest_url = "https://launchermeta.mojang.com/mc/game/version_manifest.json"
-    manifest = requests.get(manifest_url).json()
-    versions = manifest["versions"]
-    for v in versions:
-        if v["id"] == version:
-            version_manifest_url = v["url"]
-            version_manifest = requests.get(version_manifest_url).json()
-            serverURL = version_manifest["downloads"]["server"]["url"]
-            break
-        else:
-            serverURL = None
+    # Crear el directorio del servidor ahora que se han obtenido todos los datos
+    server_dir = os.path.join(BASE_DIR, name)
+    os.makedirs(server_dir, exist_ok=True)
 
-# ACTIVE
-elif server_type == 'snapshot':
-    manifest_url = "https://launchermeta.mojang.com/mc/game/version_manifest.json"
-    manifest = requests.get(manifest_url).json()
-    latest_snapshot = manifest["latest"]["snapshot"]
-    for v in manifest["versions"]:
-        if v["id"] == latest_snapshot:
-            version_manifest_url = v["url"]
-            version_manifest = requests.get(version_manifest_url).json()
-            serverURL = version_manifest["downloads"]["server"]["url"]
-            break
-        else:
-            serverURL =  None
+    # Ruta donde se descargará el archivo jar del servidor
+    jar_path = os.path.join(server_dir, "server.jar")
+    if not download_server(url, jar_path):
+        return None
 
-# ACTIVE    
-elif server_type == 'fabric':
-    loader_version = get_version_fabric("https://meta.fabricmc.net/v2/versions/loader")
-    installer_version = get_version_fabric("https://meta.fabricmc.net/v2/versions/installer")
-    if loader_version and installer_version:
-        serverURL = f"https://meta.fabricmc.net/v2/versions/loader/{version}/{loader_version}/{installer_version}/server/jar"
-    else:
-        serverURL = None
+    # Crear archivos de configuración para el servidor
+    config = {
+        "server_type": server_type,
+        "version": version,
+        "created_at": datetime.now().isoformat(),
+        "last_started": None
+    }
 
-# ACTIVE
-elif server_type == 'mohist':
-    mohist_builds_url = f"https://mohistmc.com/api/v2/projects/mohist/{version}/builds"
-    response = requests.get(mohist_builds_url)
-    if response.status_code == 200:
-        builds = response.json()["builds"]
-        serverURL = builds[-1]["url"]
-    else:
-        serverURL = None
+    # Guardar el archivo de configuración en formato JSON
+    with open(os.path.join(server_dir, "server_config.json"), 'w') as f:
+        json.dump(config, f, indent=2)
 
-# ACTIVE
-elif server_type == 'catserver':
-    jenkins_url = f"https://jenkins.rbqcloud.cn:30011/job/CatServer-{version}/lastSuccessfulBuild/api/json"
-    response = requests.get(jenkins_url)
-    if response.status_code == 200:
-        build_info = response.json()
-        artifacts = build_info.get('artifacts', [])
-        jar_url = None
+    # Crear el archivo eula.txt
+    with open(os.path.join(server_dir, 'eula.txt'), 'w') as f:
+        f.write('eula=true\n')
+
+    # Crear el archivo server.properties
+    create_server_properties(server_dir, name)
+
+    log_message(f"✅ Server '{name}' created successfully!", GREEN)
+    return name
+
+
+def run_server(server_name: str) -> None:
+    """Run the Minecraft server."""
+    server_dir = os.path.join(BASE_DIR, server_name)
+    if not os.path.exists(server_dir):
+        log_message(f"⚠️  Server directory '{server_name}' not found!", RED)
+        return
+
+    os.chdir(server_dir)
+    release_port()
+
+    try:
+        with open("server_config.json") as f:
+            config = json.load(f)
+    except Exception as e:
+        log_message(f"⚠️  Error reading server configuration: {str(e)}", RED)
+        return    
+    # Start tunnel service
+    tunnel_service = select_tunnel_service()
+    tunnel_process = tunnel_service.start_tunnel() if tunnel_service else None
+    
+    # Detectar memoria del sistema y asignar el 80% de la memoria total
+    total_memory = psutil.virtual_memory().total // (1024 ** 3)  # Convertir a GB
+    allocated_memory = int(total_memory * 0.8)  # Asignar el 80% de la memoria total
+    
+    # Start server with optimized Java flags
+    java_flags = [
+        "-Xms1G", f"-Xmx{allocated_memory}G",  # Memory allocation
+        "-XX:+UseG1GC",      # Use G1 Garbage Collector
+        "-XX:+ParallelRefProcEnabled",
+        "-XX:MaxGCPauseMillis=200",
+        "-XX:+UnlockExperimentalVMOptions",
+        "-XX:+DisableExplicitGC",
+        "-XX:+AlwaysPreTouch",
+        "-XX:G1NewSizePercent=30",
+        "-XX:G1MaxNewSizePercent=40",
+        "-XX:G1HeapRegionSize=8M",
+        "-XX:G1ReservePercent=20",
+        "-XX:G1HeapWastePercent=5",
+        "-XX:G1MixedGCCountTarget=4",
+        "-XX:InitiatingHeapOccupancyPercent=15",
+        "-XX:G1MixedGCLiveThresholdPercent=90",
+        "-XX:G1RSetUpdatingPauseTimePercent=5",
+        "-XX:SurvivorRatio=32",
+        "-XX:+PerfDisableSharedMem",
+        "-XX:MaxTenuringThreshold=1"
+    ]
+
+    java_command = ["java"] + java_flags + ["-jar", "server.jar", "nogui"]
+    
+    log_message("⚙️  Starting Minecraft server with optimized settings...", CYAN)
+    server_process = subprocess.Popen(
+        java_command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+
+    def monitor_server():
+        for line in server_process.stdout:
+            print(line.strip())
+            if "Done (" in line:
+                log_message(f"✨ Server '{server_name}' is ready!", GREEN)
+
+    server_thread = threading.Thread(target=monitor_server)
+    server_thread.daemon = True
+    server_thread.start()
+
+    try:
+        server_process.wait()
+    except KeyboardInterrupt:
+        log_message("\n🛑 Stopping server...", YELLOW)
+    finally:
+        if tunnel_process:
+            tunnel_process.terminate()
+            log_message("🔌 Tunnel service stopped", YELLOW)
+
+def main():
+    """Main program function."""
+    log_message("🎮 Minecraft Server Manager v2.0", CYAN)
+    log_message("=" * 50, BLUE)
+    
+    servers = [d for d in os.listdir(BASE_DIR) 
+              if os.path.isdir(os.path.join(BASE_DIR, d))]
+    
+    if servers:
+        choices = servers + ["📦 Create new server"]
+        selected = inquirer.prompt([
+            inquirer.List("server", 
+                         message="Select an option", 
+                         choices=choices)
+        ])["server"]
         
-        for artifact in artifacts:
-            if artifact['fileName'].endswith('.jar'):
-                jar_path = artifact['relativePath']
-                jar_url = f"https://jenkins.rbqcloud.cn:30011/job/CatServer-{version}/lastSuccessfulBuild/artifact/{jar_path}"
-                break
-
-        if jar_url:
-            serverURL = jar_url
+        if selected == "📦 Create new server":
+            selected_server = create_new_server()
         else:
-            serverURL = None
+            selected_server = selected
     else:
-        serverURL = None
+        log_message("No existing servers found. Creating new server...", YELLOW)
+        selected_server = create_new_server()
 
-# ACTIVE
-elif server_type == 'purpur':
-    purpur_api = f"https://api.purpurmc.org/v2/purpur/{version}"
-    response = requests.get(purpur_api).json()
-    if response.status_code == 200:
-        latest_build = response["builds"]["latest"]
-        serverURL = f"https://api.purpurmc.org/v2/purpur/{version}/{latest_build}/download"
+    if selected_server:
+        run_server(selected_server)
     else:
-        serverURL = None
+        log_message("⚠️  Failed to start server", RED)
 
-# Download the server.jar based on 'server_type'
-jar_name = {'paper': 'server.jar', 'fabric': 'fabric-server-launch.jar', 'forge': 'forge.jar', 'vanilla': 'vanilla.jar', 'snapshot': "snapshot.jar", 'mohist': "mohist.jar", 
-            'catserver': "catserver.jar", 'purpur': "purpur.jar"}
-
-print('Downloading the selected server...')
-
-if serverURL:
-    print('Dowloading to github codespaces...')
-    r = requests.get(serverURL)
-
-    if r.status_code == 200:
-        with open(jar_name[server_type], 'wb') as f:
-            f.write(r.content)
-    else:
-        print('Error '+ str(r.status_code) + '! The version you choose does not work.')
-
-# Run on a specific path depending on the server type
-if server_type == 'fabric':
-    subprocess.run(f'java -jar fabric-server-launch.jar server -mcversion {version} -downloadMinecraft', shell=True, check=True)
-elif server_type == 'forge':
-    os.chdir("/workspaces/codespaces-jupyter/Minecraft-server")
-    subprocess.run('java -jar forge.jar --installServer', shell=True, check=True)
-elif server_type == 'vanilla':
-    os.chdir("/workspaces/codespaces-jupyter/Minecraft-server")
-    subprocess.run('java -jar vanilla.jar --installServer', shell=True, check=True)
-    
-# Saves the configuration file on the server
-colabconfig = {"server_type": server_type, "server_version": version}
-with open("colabconfig.json", 'w') as config_file:
-    json.dump(colabconfig, config_file)
-
-# print a completion message
-print('Done!')
-
-# change eula to true
-with open('eula.txt', 'w') as file:
-    file.write('eula=true\n')
-
-# Read .env variables
-def load_name_by_env_file(variable_name, file_path='../.env'):
-    if os.path.exists(file_path):
-        with open(file_path) as f:
-            for line in f:
-                if line.startswith(variable_name):
-                    key, value = line.strip().split('=', 1)
-                    return value
-    else:
-        print(f"Error: {file_path} file not found.")
-        return None
-
-NGROK_AUTH_TOKEN = load_name_by_env_file('NGROK_AUTH_TOKEN')
-NGROK_REGION = load_name_by_env_file('NGROK_REGION')
-
-# In[1]:
-import requests
-import time
-import os
-import re
-import json
-import glob
-import threading
-import subprocess
-
-# Update Apt cache
-result = subprocess.run(['sudo', 'apt', 'update'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-if result.returncode == 0:
-    print("Apt cache successfully updated!")
-else:
-    print("Apt cache update failed, you might receive stale packages")
-
-# Assign the files to the directory
-os.makedirs("/workspaces/codespaces-jupyter/Minecraft-server", exist_ok=True)
-os.chdir("/workspaces/codespaces-jupyter/Minecraft-server")
-
-# Import the configuration file
-config_path = "/workspaces/codespaces-jupyter/Minecraft-server/colabconfig.json"
-
-if os.path.isfile(config_path):
-    with open(config_path) as config_file:
-        colabconfig = json.load(config_file)
-else:
-    colabconfig = {"server_type": "generic"} # Use the default configuration if there the configuration file does not exist
-    with open(config_path, 'w') as new_config_file:
-        json.dump(colabconfig, new_config_file)
-
-# Instal OpenJDK
-version = colabconfig["server_version"]
-
-def installjdk(v, command):
-    subprocess.run('sudo apt-get purge openjdk* -y', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    proceso = subprocess.run(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if proceso.returncode == 0:
-        print("OpenJDK version installed:", v)
-    else:
-        print("Failed to install OpenJDK:", v)
-
-# Check the version of the server and install the corresponding version of OpenJDK
-if version < "1.14":
-    v = 8
-elif version >= "1.14" and version < "1.17":
-    v = 11
-else:
-    v = 17
-
-# Install JDK version based on server version
-installjdk(v, 'sudo apt-get install openjdk-' + str(v) + '-jre-headless -y')
-
-# Check the java version
-java_ver = subprocess.run(['java', '-version'], stderr=subprocess.PIPE, text=True).stderr
-match = re.search(r'version "(\d+\.\d+)', java_ver)
-if match:
-    java_ver = match.group(1)
-else:
-    java_ver = "Couldn't determine Java version"
-print("Java version installed:", java_ver)
-
-# List of the server types and their respective jar files
-jar_list = {'paper': 'server.jar', 'fabric': 'fabric-server-launch.jar', 'generic': 'server.jar', 'forge': 'forge.jar', 'vanilla': 'vanilla.jar', 'snapshot': 'snapshot.jar', 'mohist': "mohist.jar", 'catserver': "catserver.jar", 'purpur': "purpur.jar"}
-jar_name = jar_list[colabconfig["server_type"]]
-
-# Java arguments
-if colabconfig["server_type"] == "paper":
-    server_flags = "-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1 -Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true"
-else:
-    server_flags = ""
-
-# JVM Arguments for the server
-memory_allocation = "-Xms10G -Xmx10G"
-
-# Tunnel service for the server
-tunnel_service = "ngrok"
-print("")
-print("> Using:", tunnel_service)
-
-if tunnel_service == "ngrok":
-    # Verify if pyngrok is installed
+if __name__ == "__main__":
     try:
-        import pyngrok # type: ignore
-    except ImportError:
-        subprocess.run(["pip", "install", "pyngrok"], check=True)
-
-    from pyngrok import ngrok, conf # type: ignore
-
-    # v - - - - - - - TOKEN - - - - - - - v
-    ngrok.set_auth_token(NGROK_AUTH_TOKEN)
-
-    # v - - - - - - - AVAILABLE REGIONS - - - - - - - v
-    conf.get_default().region = NGROK_REGION
-    # ap - Asia/Pacific (Singapore)
-    # au - Australia (Sydney)
-    # eu - Europa (Frankfurt - Alemania)
-    # in - India (Mumbai)
-    # jp - Japon (Tokyo)
-    # sa - South america (São Paulo - Brasil)
-    # us - United estates (Ohio)
-
-    # Conect to ngrok
-    url = ngrok.connect(25565, 'tcp')
-    print('> Server IP: ' + ((str(url).split('"')[1::2])[0]).replace('tcp://', ''))
-    print("")
-
-    # If you got the premiun version of ngrok use the comented code below to get a subdomain
-    #subdomain = "my-subdomain" # <--- Place your subdomain here inside the quotes
-    #url = ngrok.connect(25565, 'tcp', subdomain=subdomain)
-    #print('Your server ip is:  ' + url.replace('tcp://', ''))
-
-#If using playit.gg
-elif tunnel_service == "playit":
-    subprocess.run(["curl", "-SsL", "https://playit-cloud.github.io/ppa/key.gpg"], check=True)
-    subprocess.run(["sudo", "apt-key", "add", "key.gpg"], check=True)
-
-    # ADD PLAYIT.GG REPOSITORY
-    subprocess.run(["sudo", "curl", "-SsL", "-o", "/etc/apt/sources.list.d/playit-cloud.list", "https://playit-cloud.github.io/ppa/playit-cloud.list"], check=True)
-
-    # UPDATE PACKAGE LIST
-    subprocess.run(["sudo", "apt", "update"], check=True)
-
-    # INSTALL PLAYIT.GG
-    result = subprocess.run(["sudo", "apt", "install", "playit"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    # cHECK if the command was executed successfully
-    if result.returncode == 0:
-        print("Playit.gg installed")
-    else:
-        print("Failed to install Playit.gg")
-
-    # Start the server
-    print('Starting server...')
-    subprocess.run(["playit", "&", "java", "$memory_allocation", "$server_flags", "-jar", "$jar_name", "nogui"], check=True)
-
-    # Get the server IP
-    result = subprocess.run(["playit", "status"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    print("Tu ip es: " + result.stdout.decode())
-
-print('Launching server...')
-
-def get_users():
-    url = 'https://jsonplaceholder.typicode.com/users'
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            print("Updated by request!")
-        else:
-            print(f"Error making the request. Status code: {response.status_code}")
-    except requests.RequestException as e:
-        print(f"Connection failed: {e}")
-
-# Funcion for executing get_users() every 10 minutes
-def repeat_get_users():
-    while True:
-        get_users()
-        time.sleep(600)  # Wait 10 minutes
-
-# Start the thread for repeat_get_users()
-user_thread = threading.Thread(target=repeat_get_users)
-user_thread.start()
-
-# Get the configuration file
-stype = colabconfig["server_type"]
-version = colabconfig["server_version"]
-
-# Print the server type and version
-print("You are currently starting minecraft '" + stype + "-"+ version + "'")
-
-# Si el servidor es de tipo Forge antiguo no va a funcionar
-if colabconfig["server_type"] == "forge" and colabconfig["server_version"] < "1.17.1":
-    print("This forge version is not compatible with the script :(.")
-
-# If the server is a forge server, this will run the server with the forge arguments
-if colabconfig["server_type"] == "forge":
-    version = colabconfig["server_version"]
-    forgefiles = f"/workspaces/codespaces-jupyter/Minecraft-server/libraries/net/minecraftforge/forge/"
-    
-    forgepreversion = os.listdir(forgefiles)
-    
-    if forgepreversion:
-        forgeversion = forgepreversion[0]
-        forgeversionchecked = forgeversion.replace(".jar", "")
-        print("Your forge version is: ", forgeversionchecked)
-    else:
-        print("There was not any forge files.")
-    
-    pathtoforge = glob.glob(f"/workspaces/codespaces-jupyter/Minecraft-server/libraries/net/minecraftforge/forge/{forgeversionchecked}/unix_args.txt")
-
-    if pathtoforge: 
-        path = pathtoforge[0] 
-        print(path)
-        subprocess.run(f'java @user_jvm_args.txt @{path} "$@"', shell=True)
-    else:
-        print("No unix_args.txt found.")
-else:
-    subprocess.run(f'java {memory_allocation} {server_flags} -jar {jar_name} nogui', shell=True)
-
-# Cicle to keep the server running
-while True:
-    time.sleep(60)
+        main()
+    except KeyboardInterrupt:
+        log_message("\n👋 Thanks for using Minecraft Server Manager!", CYAN)
