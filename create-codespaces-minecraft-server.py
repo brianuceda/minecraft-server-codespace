@@ -12,6 +12,7 @@ import threading
 from typing import Optional, List, Tuple, Type
 from datetime import datetime
 import pty
+import time
 
 # Variables globales
 RESET = "\033[0m"
@@ -28,6 +29,27 @@ os.makedirs(BASE_DIR, exist_ok=True)
 # Actualiza el sistema y Python
 subprocess.run(["sudo", "apt", "update", "-y"], check=True)
 subprocess.run(["sudo", "apt", "upgrade", "-y"], check=True)
+
+import threading
+import time
+import subprocess
+
+def clean_ram_periodically():
+    first_run = True
+    
+    while True:
+        try:
+            subprocess.run(["sudo", "sync"], capture_output=True)
+            subprocess.run(["sudo", "sysctl", "-w", "vm.drop_caches=3"], capture_output=True)
+
+            if not first_run:
+                print("🧹 Memoria caché limpiada correctamente.")
+
+            first_run = False
+        except Exception as e:
+            print(f"⚠️ Error al limpiar caché: {e}")
+        
+        time.sleep(60)
 
 # Funciones globales
 def get_lima_time(location: str = "America/Lima"):
@@ -444,10 +466,10 @@ def create_new_server() -> Optional[str]:
 
 def start_server(ram, tunnel_process):
     master, slave = pty.openpty()
-    java_command = ["java", "-Xms1G", "-Xmx2G", "-jar", "server.jar", "nogui"]
-
+    java_command = ["java", f"-Xms{ram}G", f"-Xmx{ram}G", "-jar", "server.jar", "nogui"]
+    
     java_flags = [
-        "-Xms1G", f"-Xmx{ram}G",
+        f"-Xms{ram}G", f"-Xmx{ram}G",
         "-XX:+UseG1GC",
         "-XX:+ParallelRefProcEnabled",
         "-XX:MaxGCPauseMillis=200",
@@ -519,14 +541,22 @@ def install_and_run_server(server_name: str) -> None:
     # Start tunnel service
     tunnel_service = select_tunnel_service()
     tunnel_process = tunnel_service.start_tunnel() if tunnel_service else None
+
+    # Iniciar el proceso en un hilo separado para limpiar la RAM
+    cache_cleaner_thread = threading.Thread(target=clean_ram_periodically, daemon=True)
+    cache_cleaner_thread.start()
     
     # Asignar el 80% de la memoria total si la variable ram es None o no es un entero
     print()
     log_message("Si no se ingresa la cantidad de memoria RAM, se asignará el 80% de la memoria total", GRAY)
     ram = log_input("🔍 Ingresa la cantidad de memoria RAM (en GB) para el servidor: ")
-    if ram is None or ram is not int:
-        total_memory_im_vm = psutil.virtual_memory().total // (1024 ** 3)
-        ram = int(total_memory_im_vm * 0.8)
+    
+    # Validar si la entrada es un número, si no, asignar 80% de la RAM
+    if not ram.isdigit():
+        total_memory_vm = psutil.virtual_memory().total // (1024 ** 3)
+        ram = int(total_memory_vm * 0.8)
+    else:
+        ram = int(ram)
 
     start_server(ram, tunnel_process)
 
